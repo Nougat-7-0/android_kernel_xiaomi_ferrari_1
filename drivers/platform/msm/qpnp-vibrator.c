@@ -10,6 +10,7 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/device.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -64,6 +65,10 @@ struct qpnp_vib {
 	int state;
 	int vtg_level;
 	int timeout;
+#ifdef VENDOR_EDIT
+//Added by Tong.han@Bsp.group.Tp for vib min time setting,2015-07-07-07
+	int time_min;
+#endif/*VENDOR_EDIT*/
 	struct mutex lock;
 };
 
@@ -92,6 +97,64 @@ static int qpnp_vib_write_u8(struct qpnp_vib *vib, u8 *data, u16 reg)
 
 	return rc;
 }
+
+static ssize_t qpnp_vib_level_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct timed_output_dev *tdev = dev_get_drvdata(dev);
+	struct qpnp_vib *vib = container_of(tdev, struct qpnp_vib, timed_dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vib->vtg_level);
+}
+
+static ssize_t qpnp_vib_level_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct timed_output_dev *tdev = dev_get_drvdata(dev);
+	struct qpnp_vib *vib = container_of(tdev, struct qpnp_vib, timed_dev);
+	u8 reg;
+	int val;
+	int rc;
+
+	rc = kstrtoint(buf, 10, &val);
+	if (rc) {
+		pr_err("%s: error getting level\n", __func__);
+		return -EINVAL;
+	}
+
+	if (val < QPNP_VIB_MIN_LEVEL) {
+		pr_err("%s: level %d not in range (%d - %d), using min.",
+			__func__, val, QPNP_VIB_MIN_LEVEL, QPNP_VIB_MAX_LEVEL);
+		val = QPNP_VIB_MIN_LEVEL;
+	} else if (val > QPNP_VIB_MAX_LEVEL) {
+		pr_err("%s: level %d not in range (%d - %d), using max.",
+			__func__, val, QPNP_VIB_MIN_LEVEL, QPNP_VIB_MAX_LEVEL);
+		val = QPNP_VIB_MAX_LEVEL;
+	}
+
+	vib->vtg_level = val;
+
+	/* Configure the VTG CTL regiser */
+	rc = qpnp_vib_read_u8(vib, &reg, QPNP_VIB_VTG_CTL(vib->base));
+	if (rc < 0) {
+		pr_info("qpnp: error while reading vibration control register\n");
+		return rc;
+	}
+
+	reg &= ~QPNP_VIB_VTG_SET_MASK;
+	reg |= (vib->vtg_level & QPNP_VIB_VTG_SET_MASK);
+	rc = qpnp_vib_write_u8(vib, &reg, QPNP_VIB_VTG_CTL(vib->base));
+	if (rc < 0) {
+		pr_info("qpnp: error while writing vibration control register\n");
+		return rc;
+	}
+
+	return strnlen(buf, count);
+}
+
+static DEVICE_ATTR(vtg_level, S_IRUGO | S_IWUSR, qpnp_vib_level_show, qpnp_vib_level_store);
 
 static int qpnp_vibrator_config(struct qpnp_vib *vib)
 {
@@ -188,6 +251,11 @@ static void qpnp_vib_enable(struct timed_output_dev *dev, int value)
 	else {
 		value = (value > vib->timeout ?
 				 vib->timeout : value);
+#ifdef VENDOR_EDIT
+//Added by Tong.han@Bsp.group.Tp for vib min time setting,2015-07-07-07
+		value = (value < vib->time_min ?
+				 vib->time_min : value);
+#endif/*VENDOR_EDIT*/
 		vib->state = 1;
 		hrtimer_start(&vib->vib_timer,
 			      ktime_set(value / 1000, (value % 1000) * 1000000),
@@ -260,6 +328,18 @@ static int qpnp_vib_parse_dt(struct qpnp_vib *vib)
 		return rc;
 	}
 
+#ifdef VENDOR_EDIT
+//Added by Tong.han@Bsp.group.Tp for vib min time setting,2015-07-07-07
+	rc = of_property_read_u32(spmi->dev.of_node,
+			"qcom,vib-timemin-ms", &temp_val);
+	if (!rc) {
+		vib->time_min = temp_val;
+	} else if (rc != -EINVAL) {
+		dev_err(&spmi->dev, "Unable to read vib time_min\n");
+		vib->time_min = 0;
+	}
+#endif/*VENDOR_EDIT*/
+	
 	vib->vtg_level = QPNP_VIB_DEFAULT_VTG_LVL;
 	rc = of_property_read_u32(spmi->dev.of_node,
 			"qcom,vib-vtg-level-mV", &temp_val);
@@ -371,6 +451,8 @@ static int qpnp_vibrator_probe(struct spmi_device *spmi)
 	rc = timed_output_dev_register(&vib->timed_dev);
 	if (rc < 0)
 		return rc;
+
+	device_create_file(vib->timed_dev.dev, &dev_attr_vtg_level);
 
 	return rc;
 }
